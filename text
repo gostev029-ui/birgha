@@ -1,0 +1,3 @@
+asyncio.wait(tasks, return_when=FIRST_COMPLETED)
+→ если df непустой и len(df) >= 30 → берём и отменяем остальные
+→ иначе запоминаем как fallback и ждём следующий
