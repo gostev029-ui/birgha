@@ -1,6 +1,6 @@
 """
 ТикерСкан — бот биржевой аналитики для MAX.
-Источники: Finnhub, Twelve Data, Tiingo, MOEX ISS, Massive (Polygon).
+Источники: Finnhub, Twelve Data, Tiingo, Massive (Polygon), FMP, Alpaca, MOEX ISS.
 Yahoo Finance исключён.
 """
 import os, asyncio, time, math
@@ -16,6 +16,9 @@ FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
 TWELVEDATA_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 TIINGO_KEY = os.environ.get("TIINGO_API_KEY", "")
 MASSIVE_KEY = os.environ.get("MASSIVE_API_KEY", "")
+FMP_KEY = os.environ.get("FMP_API_KEY", "")
+ALPACA_KEY = os.environ.get("ALPACA_KEY", "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -37,7 +40,7 @@ def _cache_set(key: str, value: str) -> None:
 
 # ---------- Провайдеры ----------
 class FinnhubQuoteProvider:
-    """Быстрая цена. ~89 мс, 60 запросов/мин. История — только 2 точки."""
+    """Быстрая цена. 60 запросов/мин. История — только 2 точки."""
     name = "finnhub"
 
     def __init__(self, api_key: str):
@@ -74,7 +77,7 @@ class FinnhubQuoteProvider:
 
 
 class TwelveDataProvider:
-    """История OHLCV. 8 кредитов/мин, 800/день. Один ряд ≈ 8 кредитов."""
+    """История OHLCV. 8 кредитов/мин, 800/день."""
     name = "twelvedata"
 
     def __init__(self, api_key: str):
@@ -153,37 +156,6 @@ class TiingoProvider:
         return await asyncio.to_thread(self._sync, ticker)
 
 
-class MoexProvider:
-    """Российские акции. Без ключа, быстрый."""
-    name = "moex"
-    BASE = "https://iss.moex.com/iss"
-
-    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
-        try:
-            secid = ticker.replace(".ME", "").upper()
-            r = requests.get(
-                f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities/{secid}/candles.json",
-                params={"from": "2025-01-01", "interval": 24, "limit": 365},
-                timeout=6,
-            )
-            data = r.json().get("candles", {}).get("data", [])
-            if not data:
-                return None
-            cols = ["open", "close", "high", "low", "value", "volume", "begin", "end"]
-            df = pd.DataFrame(data, columns=cols)
-            df["begin"] = pd.to_datetime(df["begin"])
-            df = df.set_index("begin").rename(columns={
-                "open": "Open", "close": "Close", "high": "High",
-                "low": "Low", "volume": "Volume",
-            })
-            return df[["Open", "High", "Low", "Close", "Volume"]]
-        except Exception:
-            return None
-
-    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
-        return await asyncio.to_thread(self._sync, ticker)
-
-
 class MassiveProvider:
     """Резервная EOD-история. 5 запросов/мин, 15-мин задержка."""
     name = "massive"
@@ -219,6 +191,116 @@ class MassiveProvider:
         return await asyncio.to_thread(self._sync, ticker)
 
 
+class FMPProvider:
+    """История EOD. 250 запросов/день, 5/сек."""
+    name = "fmp"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.api_key:
+            return None
+        try:
+            r = requests.get(
+                f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
+                params={"apikey": self.api_key, "from": "2025-01-01"},
+                timeout=8,
+            )
+            js = r.json()
+            hist = js.get("historical")
+            if not hist:
+                return None
+            df = pd.DataFrame(hist)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+            df = df.rename(columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            })
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
+class AlpacaProvider:
+    """История с 2016 г., IEX (15-мин задержка). 200 запросов/мин."""
+    name = "alpaca"
+
+    def __init__(self, key: str, secret: str):
+        self.key = key
+        self.secret = secret
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.key or not self.secret:
+            return None
+        try:
+            r = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                params={
+                    "timeframe": "1Day",
+                    "start": "2025-01-01",
+                    "limit": 1000,
+                    "feed": "iex",
+                },
+                headers={
+                    "APCA-API-KEY-ID": self.key,
+                    "APCA-API-SECRET-KEY": self.secret,
+                },
+                timeout=8,
+            )
+            js = r.json()
+            bars = js.get("bars")
+            if not bars:
+                return None
+            df = pd.DataFrame(bars)
+            df["t"] = pd.to_datetime(df["t"])
+            df = df.set_index("t").rename(columns={
+                "o": "Open", "h": "High", "l": "Low",
+                "c": "Close", "v": "Volume",
+            })
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
+class MoexProvider:
+    """Российские акции. Без ключа, быстрый."""
+    name = "moex"
+    BASE = "https://iss.moex.com/iss"
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        try:
+            secid = ticker.replace(".ME", "").upper()
+            r = requests.get(
+                f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities/{secid}/candles.json",
+                params={"from": "2025-01-01", "interval": 24, "limit": 365},
+                timeout=6,
+            )
+            data = r.json().get("candles", {}).get("data", [])
+            if not data:
+                return None
+            cols = ["open", "close", "high", "low", "value", "volume", "begin", "end"]
+            df = pd.DataFrame(data, columns=cols)
+            df["begin"] = pd.to_datetime(df["begin"])
+            df = df.set_index("begin").rename(columns={
+                "open": "Open", "close": "Close", "high": "High",
+                "low": "Low", "volume": "Volume",
+            })
+            return df[["Open", "High", "Low", "Close", "Volume"]]
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
 # ---------- Реестр провайдеров ----------
 PROVIDERS = [MoexProvider()]
 if FINNHUB_KEY:
@@ -229,6 +311,10 @@ if TIINGO_KEY:
     PROVIDERS.append(TiingoProvider(TIINGO_KEY))
 if MASSIVE_KEY:
     PROVIDERS.append(MassiveProvider(MASSIVE_KEY))
+if FMP_KEY:
+    PROVIDERS.append(FMPProvider(FMP_KEY))
+if ALPACA_KEY and ALPACA_SECRET:
+    PROVIDERS.append(AlpacaProvider(ALPACA_KEY, ALPACA_SECRET))
 
 
 async def fetch_best(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
@@ -250,12 +336,10 @@ async def fetch_best(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
                 if df is None or df.empty:
                     continue
                 name = tasks[task]
-                # Достаточно истории для RSI, MACD, Bollinger
                 if len(df) >= 30:
                     for p in pending:
                         p.cancel()
                     return df, name
-                # Мало истории (например, Finnhub с 2 точками) — запоминаем
                 if fallback is None:
                     fallback = (df, name)
         return fallback if fallback else (None, "none")
