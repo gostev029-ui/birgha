@@ -1,4 +1,6 @@
 """
+pip install -r requirements.txt
+streamlit run admin.py
 ТикерСкан Admin — веб-оболочка для управления ботом.
 Запуск: streamlit run admin.py
 """
