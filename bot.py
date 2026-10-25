@@ -1,25 +1,21 @@
-
-pip install -U maxapi-sdk
 """
-ТикерСкан — бот биржевой аналитики для MAX.
-Источники: Finnhub, Twelve Data, Tiingo, Massive (Polygon), FMP, Alpaca, MOEX ISS.
+ТикерСкан — бот биржевой аналитики для MAX (российские источники).
+Источники: MOEX ISS, T-Invest API, ALOR OpenAPI.
 """
 import os, asyncio, time, math
 from typing import Optional
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import requests
-from maxapi import Bot, Dispatcher, InlineKeyboardBuilder
+
+from maxapi import Bot, Command, Dispatcher, InlineKeyboardBuilder
 
 # ---------- Конфигурация ----------
-BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
-FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
-TWELVEDATA_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
-TIINGO_KEY = os.environ.get("TIINGO_API_KEY", "")
-MASSIVE_KEY = os.environ.get("MASSIVE_API_KEY", "")
-FMP_KEY = os.environ.get("FMP_API_KEY", "")
-ALPACA_KEY = os.environ.get("ALPACA_KEY", "")
-ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
+BOT_TOKEN = os.environ["f9LHodD0cOIufBeN0Ltbm_vtj-m01OQdGy_4_M2c_j2Sjk7TVXjBpkc3KclsoQhv0l5ECQc2s4yd5UzVn671"]
+TINKOFF_TOKEN = os.environ.get("TINKOFF_TOKEN", "")
+ALOR_TOKEN = os.environ.get("ALOR_TOKEN", "")
 
 BANNER_URL = "https://placehold.co/1024x512/0f172a/38bdf8?text=TickerScan&font=roboto"
 
@@ -42,152 +38,163 @@ def _cache_set(key: str, value: str) -> None:
     _CACHE[key] = (time.time(), value)
 
 
-# ================= ПРОВАЙДЕРЫ =================
-class FinnhubQuoteProvider:
-    name = "finnhub"
-    def __init__(self, api_key: str): self.api_key = api_key
-    def _sync(self, ticker: str):
-        if not self.api_key: return None
-        try:
-            r = requests.get("https://finnhub.io/api/v1/quote",
-                             params={"symbol": ticker, "token": self.api_key}, timeout=5)
-            js = r.json(); price, prev = js.get("c"), js.get("pc")
-            if not price or price <= 0: return None
-            idx = pd.to_datetime([pd.Timestamp.today() - pd.Timedelta(days=1), pd.Timestamp.today()])
-            return pd.DataFrame({"Close": [prev, price], "Open": [prev, price],
-                                 "High": [prev, price], "Low": [prev, price],
-                                 "Volume": [0, 0]}, index=idx)
-        except Exception: return None
-    async def fetch(self, ticker: str):
-        return await asyncio.to_thread(self._sync, ticker)
-
-
-class TwelveDataProvider:
-    name = "twelvedata"
-    def __init__(self, api_key: str): self.api_key = api_key
-    def _sync(self, ticker: str):
-        if not self.api_key: return None
-        try:
-            r = requests.get("https://api.twelvedata.com/time_series",
-                             params={"symbol": ticker, "interval": "1day", "outputsize": 365,
-                                     "apikey": self.api_key, "format": "JSON"}, timeout=8)
-            js = r.json()
-            if "values" not in js: return None
-            df = pd.DataFrame(js["values"]); df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime").sort_index().rename(columns={
-                "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-            for c in ["Open", "High", "Low", "Close", "Volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        except Exception: return None
-    async def fetch(self, ticker: str):
-        return await asyncio.to_thread(self._sync, ticker)
-
-
-class TiingoProvider:
-    name = "tiingo"
-    def __init__(self, api_key: str): self.api_key = api_key
-    def _sync(self, ticker: str):
-        if not self.api_key: return None
-        try:
-            r = requests.get(f"https://api.tiingo.com/tiingo/daily/{ticker}/prices",
-                             params={"startDate": "2025-01-01", "token": self.api_key, "format": "json"}, timeout=8)
-            data = r.json()
-            if not isinstance(data, list) or not data: return None
-            df = pd.DataFrame(data); df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index().rename(columns={
-                "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        except Exception: return None
-    async def fetch(self, ticker: str):
-        return await asyncio.to_thread(self._sync, ticker)
-
-
-class MassiveProvider:
-    name = "massive"
-    def __init__(self, api_key: str): self.api_key = api_key
-    def _sync(self, ticker: str):
-        if not self.api_key: return None
-        try:
-            r = requests.get(f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/day/2025-01-01/2026-12-31",
-                             params={"adjusted": "true", "sort": "asc", "limit": 1000},
-                             headers={"Authorization": f"Bearer {self.api_key}"}, timeout=8)
-            js = r.json(); results = js.get("results")
-            if not results: return None
-            df = pd.DataFrame(results); df["t"] = pd.to_datetime(df["t"], unit="ms")
-            df = df.set_index("t").rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        except Exception: return None
-    async def fetch(self, ticker: str):
-        return await asyncio.to_thread(self._sync, ticker)
-
-
-class FMPProvider:
-    name = "fmp"
-    def __init__(self, api_key: str): self.api_key = api_key
-    def _sync(self, ticker: str):
-        if not self.api_key: return None
-        try:
-            r = requests.get(f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
-                             params={"apikey": self.api_key, "from": "2025-01-01"}, timeout=8)
-            js = r.json(); hist = js.get("historical")
-            if not hist: return None
-            df = pd.DataFrame(hist); df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index().rename(columns={
-                "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        except Exception: return None
-    async def fetch(self, ticker: str):
-        return await asyncio.to_thread(self._sync, ticker)
-
-
-class AlpacaProvider:
-    name = "alpaca"
-    def __init__(self, key: str, secret: str):
-        self.key, self.secret = key, secret
-    def _sync(self, ticker: str):
-        if not self.key or not self.secret: return None
-        try:
-            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
-                             params={"timeframe": "1Day", "start": "2025-01-01", "limit": 1000, "feed": "iex"},
-                             headers={"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret}, timeout=8)
-            js = r.json(); bars = js.get("bars")
-            if not bars: return None
-            df = pd.DataFrame(bars); df["t"] = pd.to_datetime(df["t"])
-            df = df.set_index("t").rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        except Exception: return None
-    async def fetch(self, ticker: str):
-        return await asyncio.to_thread(self._sync, ticker)
-
-
+# ================= ПРОВАЙДЕР: MOEX ISS (без ключа) =================
 class MoexProvider:
+    """MOEX ISS API — бесплатно, без ключа, задержка ~15 минут."""
     name = "moex"
+
     BASE = "https://iss.moex.com/iss"
-    def _sync(self, ticker: str):
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
         try:
             secid = ticker.replace(".ME", "").upper()
-            r = requests.get(f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities/{secid}/candles.json",
-                             params={"from": "2025-01-01", "interval": 24, "limit": 365}, timeout=6)
-            data = r.json().get("candles", {}).get("data", [])
-            if not data: return None
-            cols = ["open", "close", "high", "low", "value", "volume", "begin", "end"]
-            df = pd.DataFrame(data, columns=cols); df["begin"] = pd.to_datetime(df["begin"])
-            df = df.set_index("begin").rename(columns={
-                "open": "Open", "close": "Close", "high": "High", "low": "Low", "volume": "Volume"})
-            return df[["Open", "High", "Low", "Close", "Volume"]]
-        except Exception: return None
-    async def fetch(self, ticker: str):
+            # Пробуем основную доску TQBR, затем TQTF (ETF) и TQIF (иностранные)
+            for board in ("TQBR", "TQTF", "TQIF"):
+                url = (
+                    f"{self.BASE}/engines/stock/markets/shares/boards/"
+                    f"{board}/securities/{secid}/candles.json"
+                )
+                r = requests.get(
+                    url,
+                    params={"from": "2025-01-01", "interval": 24, "limit": 365},
+                    timeout=6,
+                )
+                data = r.json().get("candles", {}).get("data", [])
+                if data:
+                    cols = ["open", "close", "high", "low", "value", "volume", "begin", "end"]
+                    df = pd.DataFrame(data, columns=cols)
+                    df["begin"] = pd.to_datetime(df["begin"])
+                    df = df.set_index("begin").rename(columns={
+                        "open": "Open", "close": "Close", "high": "High",
+                        "low": "Low", "volume": "Volume",
+                    })
+                    return df[["Open", "High", "Low", "Close", "Volume"]]
+            return None
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
         return await asyncio.to_thread(self._sync, ticker)
 
 
+# ================= ПРОВАЙДЕР: T-Invest (опционально) =================
+class TinkoffProvider:
+    """T-Invest API — бесплатно, нужен брокерский счёт и токен."""
+    name = "tinkoff"
+
+    BASE = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1"
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def _figi(self, ticker: str) -> Optional[str]:
+        """Ищем FIGI по тикеру через справочник инструментов."""
+        try:
+            r = requests.post(
+                f"{self.BASE}.InstrumentsService/ShareBy",
+                json={"idType": "TICKER", "id": ticker.upper()},
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=6,
+            )
+            js = r.json()
+            return js.get("figi")
+        except Exception:
+            return None
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.token:
+            return None
+        try:
+            figi = self._figi(ticker)
+            if not figi:
+                return None
+            to = datetime.utcnow()
+            frm = to - timedelta(days=365)
+            r = requests.post(
+                f"{self.BASE}.MarketDataService/GetCandles",
+                json={
+                    "figi": figi,
+                    "from": frm.isoformat() + "Z",
+                    "to": to.isoformat() + "Z",
+                    "interval": "CANDLE_INTERVAL_DAY",
+                },
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=8,
+            )
+            candles = r.json().get("candles", [])
+            if not candles:
+                return None
+            rows = []
+            for c in candles:
+                rows.append({
+                    "Open": float(c["open"]["units"]) + c["open"].get("nano", 0) / 1e9,
+                    "High": float(c["high"]["units"]) + c["high"].get("nano", 0) / 1e9,
+                    "Low": float(c["low"]["units"]) + c["low"].get("nano", 0) / 1e9,
+                    "Close": float(c["close"]["units"]) + c["close"].get("nano", 0) / 1e9,
+                    "Volume": int(c.get("volume", 0)),
+                    "time": c["time"],
+                })
+            df = pd.DataFrame(rows)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time").sort_index()
+            return df[["Open", "High", "Low", "Close", "Volume"]]
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
+# ================= ПРОВАЙДЕР: ALOR OpenAPI (опционально) =================
+class AlorProvider:
+    """ALOR OpenAPI — бесплатно, регистрация на alor.dev."""
+    name = "alor"
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.token:
+            return None
+        try:
+            # ALOR использует тикеры с суффиксом биржи: SBER@MOEX
+            symbol = ticker.upper().replace(".ME", "") + "@MOEX"
+            r = requests.get(
+                f"https://api.alor.ru/md/history/chart",
+                params={
+                    "symbol": symbol,
+                    "exchange": "MOEX",
+                    "tf": "D",
+                    "from": int((datetime.utcnow() - timedelta(days=365)).timestamp()),
+                    "to": int(datetime.utcnow().timestamp()),
+                    "token": self.token,
+                },
+                timeout=8,
+            )
+            js = r.json()
+            bars = js.get("history", {}).get("bars", [])
+            if not bars:
+                return None
+            df = pd.DataFrame(bars)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df = df.set_index("time").sort_index().rename(columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            })
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
+# ---------- Реестр провайдеров ----------
 PROVIDERS = [MoexProvider()]
-if FINNHUB_KEY: PROVIDERS.append(FinnhubQuoteProvider(FINNHUB_KEY))
-if TWELVEDATA_KEY: PROVIDERS.append(TwelveDataProvider(TWELVEDATA_KEY))
-if TIINGO_KEY: PROVIDERS.append(TiingoProvider(TIINGO_KEY))
-if MASSIVE_KEY: PROVIDERS.append(MassiveProvider(MASSIVE_KEY))
-if FMP_KEY: PROVIDERS.append(FMPProvider(FMP_KEY))
-if ALPACA_KEY and ALPACA_SECRET: PROVIDERS.append(AlpacaProvider(ALPACA_KEY, ALPACA_SECRET))
+if TINKOFF_TOKEN:
+    PROVIDERS.append(TinkoffProvider(TINKOFF_TOKEN))
+if ALOR_TOKEN:
+    PROVIDERS.append(AlorProvider(ALOR_TOKEN))
 
 
 async def fetch_best(ticker: str):
@@ -198,17 +205,23 @@ async def fetch_best(ticker: str):
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                try: df = task.result()
-                except Exception: continue
-                if df is None or df.empty: continue
+                try:
+                    df = task.result()
+                except Exception:
+                    continue
+                if df is None or df.empty:
+                    continue
                 name = tasks[task]
                 if len(df) >= 30:
-                    for p in pending: p.cancel()
+                    for p in pending:
+                        p.cancel()
                     return df, name
-                if fallback is None: fallback = (df, name)
+                if fallback is None:
+                    fallback = (df, name)
         return fallback if fallback else (None, "none")
     finally:
-        for p in pending: p.cancel()
+        for p in pending:
+            p.cancel()
 
 
 # ================= ИНДИКАТОРЫ =================
@@ -232,7 +245,9 @@ def _macd_hist(close, fast=12, slow=26, signal=9):
 def _bollinger(close, period=20, num_std=2):
     mid = close.rolling(period).mean()
     std = close.rolling(period).std()
-    return (float((mid + num_std * std).iloc[-1]), float(mid.iloc[-1]), float((mid - num_std * std).iloc[-1]))
+    return (float((mid + num_std * std).iloc[-1]),
+            float(mid.iloc[-1]),
+            float((mid - num_std * std).iloc[-1]))
 
 
 def _atr(df, period=14):
@@ -245,12 +260,15 @@ def _atr(df, period=14):
 
 def _forecast(close, horizon):
     lr = np.log(close / close.shift(1)).dropna()
-    if len(lr) < 20: return None
+    if len(lr) < 20:
+        return None
     mu, sigma = float(lr.mean()), float(lr.std())
     last = float(close.iloc[-1])
-    return {"forecast": last * math.exp(mu * horizon),
-            "lower": last * math.exp(mu * horizon - 1.96 * sigma * math.sqrt(horizon)),
-            "upper": last * math.exp(mu * horizon + 1.96 * sigma * math.sqrt(horizon))}
+    return {
+        "forecast": last * math.exp(mu * horizon),
+        "lower": last * math.exp(mu * horizon - 1.96 * sigma * math.sqrt(horizon)),
+        "upper": last * math.exp(mu * horizon + 1.96 * sigma * math.sqrt(horizon)),
+    }
 
 
 def _arrow(v: float) -> str:
@@ -316,7 +334,8 @@ def _build_forecast_report(ticker: str, df: pd.DataFrame, source: str) -> str:
 
     if "Volume" in df.columns and len(close) >= 20:
         vol = df["Volume"].squeeze()
-        avg20 = float(vol.tail(20).mean()); lv = float(vol.iloc[-1])
+        avg20 = float(vol.tail(20).mean())
+        lv = float(vol.iloc[-1])
         if avg20 > 0:
             lines.append(f"Объём:     {lv:,.0f}  ·  {lv / avg20:.1f}× среднего")
 
@@ -390,7 +409,7 @@ async def _process(tickers: list[str], mode: str) -> str:
     for t in tickers:
         df, source = await fetch_best(t)
         if df is None:
-            parts.append(f"❌ <b>{t.upper()}</b>\nДанные не найдены ни в одном источнике.")
+            parts.append(f"❌ <b>{t.upper()}</b>\nДанные не найдены на MOEX. Проверьте тикер.")
             continue
         if mode == "target":
             parts.append(_build_target_report(t, df, source))
@@ -426,26 +445,26 @@ def _after_report_keyboard():
 async def _show_menu(event):
     _USER_STATE.pop(event.message.sender.user_id, None)
     await event.message.answer(
-        "<b>ТикерСкан</b> — быстрая аналитика котировок.\n"
+        attachments=[{"type": "image", "payload": {"url": BANNER_URL}}],
+    )
+    await event.message.answer(
+        "<b>ТикерСкан</b> — аналитика российских акций.\n"
         "━━━━━━━━━━━━━━\n"
         "Выберите действие:",
-        attachments=[
-            {"type": "image", "payload": {"url": BANNER_URL}},
-        ],
         keyboard=_main_menu_keyboard(),
     )
+
+
+@dp.message_created(Command("start"))
+async def on_start(event):
+    await _show_menu(event)
 
 
 @dp.message_created()
 async def on_message(event):
     text = (event.message.body.text or "").strip()
-    user_id = event.message.sender.user_id
 
-    if text == "/start":
-        await _show_menu(event)
-        return
-
-    if not text or text.startswith("/"):
+    if text.startswith("/"):
         return
 
     raw = text.replace(";", ",").replace(" ", ",")
@@ -453,13 +472,17 @@ async def on_message(event):
         t.strip().upper() for t in raw.split(",") if t.strip()
     ))[:5]
 
+    if not tickers:
+        return
+
+    user_id = event.message.sender.user_id
     mode = _USER_STATE.pop(user_id, None) or "forecast"
 
     await event.message.answer(f"⏳ <i>Считаю {'цель' if mode == 'target' else 'прогноз'}…</i>")
     try:
         result = await asyncio.wait_for(_process(tickers, mode), timeout=15)
     except asyncio.TimeoutError:
-        result = "⏱ Источники не ответили за 15 секунд."
+        result = "⏱ Источники не ответили за 15 секунд. Попробуйте позже."
     except Exception as e:
         result = f"❌ Ошибка: {e}"
 
@@ -479,7 +502,7 @@ async def on_callback(event):
         _USER_STATE[user_id] = "forecast"
         await event.message.answer(
             "📈 <b>Прогноз</b>\n━━━━━━━━━━━━━━\n"
-            "Напишите тикер: <code>AAPL</code>, <code>MSFT</code>, <code>SBER</code>."
+            "Напишите тикер: <code>SBER</code>, <code>GAZP</code>, <code>LKOH</code>."
         )
         return
 
@@ -494,9 +517,8 @@ async def on_callback(event):
 
 async def _warmup():
     try:
-        await _process(["AAPL"], "forecast")
-        await _process(["SBER"], "target")
-        print("Кэш прогрет")
+        await _process(["SBER"], "forecast")
+        print("Кэш прогрет: SBER")
     except Exception as e:
         print("Warmup error:", e)
 
@@ -506,4 +528,3 @@ if __name__ == "__main__":
         asyncio.create_task(_warmup())
         await dp.start_polling(bot)
     asyncio.run(main())
-)
