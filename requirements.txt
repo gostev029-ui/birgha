@@ -1,4 +1,3 @@
 maxapi-sdk
-yfinance[curl]
 pandas
 requests
