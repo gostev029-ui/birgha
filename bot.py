@@ -4,7 +4,7 @@ import yfinance as yf
 import pandas as pd
 from maxapi import Bot, Dispatcher
 
-BOT_TOKEN = os.environ["Mf9LHodD0cOJaSej0PJ158OVJ4kfyL5hrieilI7qEEY4GQvpr2vbMYE1qGLN4dERuHMxbhwS3IJkvYv9Ao5QT"]
+BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DB = "users.db"
 
