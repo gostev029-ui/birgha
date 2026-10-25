@@ -1,25 +1,24 @@
 """
-ТикерСкан — бот биржевой аналитики для мессенджера MAX.
-Источники данных: Yahoo Finance, MOEX ISS, Twelve Data, Finnhub.
+ТикерСкан — бот биржевой аналитики для MAX.
+Источники: Finnhub, Twelve Data, Tiingo, MOEX ISS, Massive (Polygon).
+Yahoo Finance исключён.
 """
 import os, asyncio, time, math
 from typing import Optional
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
-from curl_cffi import requests as cffi_requests
 from maxapi import Bot, Dispatcher
 
 # ---------- Конфигурация ----------
 BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
-TWELVEDATA_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
+TWELVEDATA_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+TIINGO_KEY = os.environ.get("TIINGO_API_KEY", "")
+MASSIVE_KEY = os.environ.get("MASSIVE_API_KEY", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-_SESSION = cffi_requests.Session(impersonate="chrome120")
 
 _CACHE: dict[str, tuple[float, str]] = {}
 _CACHE_TTL = 900  # 15 минут
@@ -36,15 +35,117 @@ def _cache_set(key: str, value: str) -> None:
     _CACHE[key] = (time.time(), value)
 
 
-# ---------- Провайдеры данных ----------
-class YahooProvider:
-    name = "yahoo"
+# ---------- Провайдеры ----------
+class FinnhubQuoteProvider:
+    """Быстрая цена. ~89 мс, 60 запросов/мин. История — только 2 точки."""
+    name = "finnhub"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
 
     def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.api_key:
+            return None
         try:
-            t = yf.Ticker(ticker, session=_SESSION)
-            df = t.history(period="1y", interval="1d", auto_adjust=True, timeout=6)
-            return df if df is not None and not df.empty else None
+            r = requests.get(
+                "https://finnhub.io/api/v1/quote",
+                params={"symbol": ticker, "token": self.api_key},
+                timeout=5,
+            )
+            js = r.json()
+            price, prev = js.get("c"), js.get("pc")
+            if not price or price <= 0:
+                return None
+            idx = pd.to_datetime([
+                pd.Timestamp.today() - pd.Timedelta(days=1),
+                pd.Timestamp.today(),
+            ])
+            return pd.DataFrame(
+                {"Close": [prev, price], "Open": [prev, price],
+                 "High": [prev, price], "Low": [prev, price],
+                 "Volume": [0, 0]},
+                index=idx,
+            )
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
+class TwelveDataProvider:
+    """История OHLCV. 8 кредитов/мин, 800/день. Один ряд ≈ 8 кредитов."""
+    name = "twelvedata"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.api_key:
+            return None
+        try:
+            r = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol": ticker,
+                    "interval": "1day",
+                    "outputsize": 365,
+                    "apikey": self.api_key,
+                    "format": "JSON",
+                },
+                timeout=8,
+            )
+            js = r.json()
+            if "values" not in js:
+                return None
+            df = pd.DataFrame(js["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.set_index("datetime").sort_index()
+            df = df.rename(columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            })
+            for c in ["Open", "High", "Low", "Close", "Volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception:
+            return None
+
+    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
+        return await asyncio.to_thread(self._sync, ticker)
+
+
+class TiingoProvider:
+    """История EOD + IEX real-time. 1000/день, 50/час."""
+    name = "tiingo"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        if not self.api_key:
+            return None
+        try:
+            r = requests.get(
+                f"https://api.tiingo.com/tiingo/daily/{ticker}/prices",
+                params={
+                    "startDate": "2025-01-01",
+                    "token": self.api_key,
+                    "format": "json",
+                },
+                timeout=8,
+            )
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                return None
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+            df = df.rename(columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            })
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         except Exception:
             return None
 
@@ -53,14 +154,18 @@ class YahooProvider:
 
 
 class MoexProvider:
+    """Российские акции. Без ключа, быстрый."""
     name = "moex"
     BASE = "https://iss.moex.com/iss"
 
     def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
         try:
             secid = ticker.replace(".ME", "").upper()
-            url = f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities/{secid}/candles.json"
-            r = requests.get(url, params={"from": "2025-01-01", "interval": 24, "limit": 365}, timeout=6)
+            r = requests.get(
+                f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities/{secid}/candles.json",
+                params={"from": "2025-01-01", "interval": 24, "limit": 365},
+                timeout=6,
+            )
             data = r.json().get("candles", {}).get("data", [])
             if not data:
                 return None
@@ -79,9 +184,9 @@ class MoexProvider:
         return await asyncio.to_thread(self._sync, ticker)
 
 
-class TwelveDataProvider:
-    name = "twelvedata"
-    BASE = "https://api.twelvedata.com/time_series"
+class MassiveProvider:
+    """Резервная EOD-история. 5 запросов/мин, 15-мин задержка."""
+    name = "massive"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -90,19 +195,22 @@ class TwelveDataProvider:
         if not self.api_key:
             return None
         try:
-            params = {"symbol": ticker, "interval": "1day", "outputsize": 365,
-                      "apikey": self.api_key, "format": "JSON"}
-            js = requests.get(self.BASE, params=params, timeout=6).json()
-            if "values" not in js:
+            r = requests.get(
+                f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/day/2025-01-01/2026-12-31",
+                params={"adjusted": "true", "sort": "asc", "limit": 1000},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=8,
+            )
+            js = r.json()
+            results = js.get("results")
+            if not results:
                 return None
-            df = pd.DataFrame(js["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime").sort_index().rename(columns={
-                "open": "Open", "high": "High", "low": "Low",
-                "close": "Close", "volume": "Volume",
+            df = pd.DataFrame(results)
+            df["t"] = pd.to_datetime(df["t"], unit="ms")
+            df = df.set_index("t").rename(columns={
+                "o": "Open", "h": "High", "l": "Low",
+                "c": "Close", "v": "Volume",
             })
-            for c in ["Open", "High", "Low", "Close", "Volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
             return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         except Exception:
             return None
@@ -111,58 +219,46 @@ class TwelveDataProvider:
         return await asyncio.to_thread(self._sync, ticker)
 
 
-class FinnhubQuoteProvider:
-    """Быстрый резерв: только текущая цена, без истории."""
-    name = "finnhub"
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def _sync(self, ticker: str) -> Optional[pd.DataFrame]:
-        if not self.api_key:
-            return None
-        try:
-            r = requests.get("https://finnhub.io/api/v1/quote",
-                             params={"symbol": ticker, "token": self.api_key}, timeout=6)
-            js = r.json()
-            price, prev = js.get("c"), js.get("pc")
-            if not price or price <= 0:
-                return None
-            idx = pd.to_datetime([pd.Timestamp.today() - pd.Timedelta(days=1), pd.Timestamp.today()])
-            return pd.DataFrame({"Close": [prev, price], "Open": [prev, price],
-                                 "High": [prev, price], "Low": [prev, price],
-                                 "Volume": [0, 0]}, index=idx)
-        except Exception:
-            return None
-
-    async def fetch(self, ticker: str) -> Optional[pd.DataFrame]:
-        return await asyncio.to_thread(self._sync, ticker)
-
-
-PROVIDERS = [YahooProvider(), MoexProvider()]
-if TWELVEDATA_KEY:
-    PROVIDERS.append(TwelveDataProvider(TWELVEDATA_KEY))
+# ---------- Реестр провайдеров ----------
+PROVIDERS = [MoexProvider()]
 if FINNHUB_KEY:
     PROVIDERS.append(FinnhubQuoteProvider(FINNHUB_KEY))
+if TWELVEDATA_KEY:
+    PROVIDERS.append(TwelveDataProvider(TWELVEDATA_KEY))
+if TIINGO_KEY:
+    PROVIDERS.append(TiingoProvider(TIINGO_KEY))
+if MASSIVE_KEY:
+    PROVIDERS.append(MassiveProvider(MASSIVE_KEY))
 
 
-async def fetch_any(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
-    """Параллельный опрос всех провайдеров — берём первый успешный."""
+async def fetch_best(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
+    """Параллельный опрос. Приоритет — первый ответ с историей >= 30 точек."""
     tasks = {asyncio.create_task(p.fetch(ticker)): p.name for p in PROVIDERS}
     pending = set(tasks)
+    fallback: Optional[tuple[pd.DataFrame, str]] = None
+
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
             for task in done:
                 try:
                     df = task.result()
                 except Exception:
                     continue
-                if df is not None and not df.empty:
+                if df is None or df.empty:
+                    continue
+                name = tasks[task]
+                # Достаточно истории для RSI, MACD, Bollinger
+                if len(df) >= 30:
                     for p in pending:
                         p.cancel()
-                    return df, tasks[task]
-        return None, "none"
+                    return df, name
+                # Мало истории (например, Finnhub с 2 точками) — запоминаем
+                if fallback is None:
+                    fallback = (df, name)
+        return fallback if fallback else (None, "none")
     finally:
         for p in pending:
             p.cancel()
@@ -178,7 +274,7 @@ def _rsi(close: pd.Series, period: int = 14) -> float:
     return float(val) if pd.notna(val) else float("nan")
 
 
-def _macd(close: pd.Series, fast=12, slow=26, signal=9):
+def _macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> float:
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -240,7 +336,7 @@ def _build_report(ticker: str, df: pd.DataFrame, source: str) -> str:
         lines.append(f"\nRSI(14): {rsi:.1f} ({zone})")
 
     if len(close) >= 26:
-        hist = _macd(close)
+        hist = _macd_hist(close)
         lines.append(f"MACD hist: {hist:+.3f} ({'бычий' if hist > 0 else 'медвежий'})")
 
     if len(close) >= 20:
@@ -292,7 +388,7 @@ async def analyze_async(tickers: list[str]) -> str:
 
     parts = []
     for t in tickers:
-        df, source = await fetch_any(t)
+        df, source = await fetch_best(t)
         if df is None:
             parts.append(f"📊 {t.upper()}\nНе удалось получить данные ни из одного источника.")
         else:
@@ -336,7 +432,6 @@ async def on_message(event):
 
 
 async def _warmup():
-    """Прогрев кэша популярных тикеров при старте."""
     try:
         await analyze_async(["AAPL", "SBER"])
         print("Кэш прогрет: AAPL, SBER")
