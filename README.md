@@ -44,7 +44,12 @@ venv\Scripts\activate            # Windows
 
 pip install -r requirements.txt
 
-set MAX_BOT_TOKEN=ваш_токен      # Windows
+set MAX_BOT_TOKEN=f9LHodD0cOIufBeN0Ltbm_vtj-m01OQdGy_4_M2c_j2Sjk7TVXjBpkc3KclsoQhv0l5ECQc2s4yd5UzVn671      # Windows
 # export MAX_BOT_TOKEN=...       # Linux/macOS
+## Оформление
+- Баннер при `/start` — задаётся константой `BANNER_URL` в `bot.py`.
+- Две inline-кнопки быстрого доступа: `📊 AAPL` и `🇷🇺 SBER`.
+- После каждого отчёта — кнопки `📊 Ещё тикер` и `🏠 Меню`.
+- Чтобы заменить баннер: положите `banner.png` в репозиторий и обновите `BANNER_URL` на raw-URL GitHub.
 
 python bot.py
