@@ -10,6 +10,8 @@ import pandas as pd
 import requests
 from maxapi import Bot, Dispatcher
 
+BANNER_URL = "https://raw.githubusercontent.com/gostev029-ui/birgha/main/banner.png"
+
 # ---------- Конфигурация ----------
 BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
