@@ -1,5 +1,7 @@
+
+pip install -U maxapi-sdk
 """
-Биржевой Радар — бот биржевой аналитики для MAX.
+ТикерСкан — бот биржевой аналитики для MAX.
 Источники: Finnhub, Twelve Data, Tiingo, Massive (Polygon), FMP, Alpaca, MOEX ISS.
 """
 import os, asyncio, time, math
@@ -7,8 +9,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import requests
-from maxapi import Bot, Dispatcher
-from maxapi.types import InlineKeyboardBuilder, CallbackButton
+from maxapi import Bot, Dispatcher, InlineKeyboardBuilder
 
 # ---------- Конфигурация ----------
 BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
@@ -41,7 +42,7 @@ def _cache_set(key: str, value: str) -> None:
     _CACHE[key] = (time.time(), value)
 
 
-# ================= ПРОВАЙДЕРЫ (без изменений) =================
+# ================= ПРОВАЙДЕРЫ =================
 class FinnhubQuoteProvider:
     name = "finnhub"
     def __init__(self, api_key: str): self.api_key = api_key
@@ -256,7 +257,7 @@ def _arrow(v: float) -> str:
     return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
 
 
-# ================= ОТЧЁТ: ПОЛНЫЙ ПРОГНОЗ =================
+# ================= ОТЧЁТ: ПРОГНОЗ =================
 def _build_forecast_report(ticker: str, df: pd.DataFrame, source: str) -> str:
     close = df["Close"].squeeze()
     if len(close) < 5:
@@ -364,12 +365,11 @@ def _build_target_report(ticker: str, df: pd.DataFrame, source: str) -> str:
             )
 
     if targets:
-        main_label, main_fc, main_pot = targets[-1]  # 20-дневная цель
+        main_label, main_fc, main_pot = targets[-1]
         lines.append("\n━━━━━━━━━━━━━━")
         lines.append(f"🎯 <b>Целевая цена ({main_label})</b>: <b>{main_fc['forecast']:.2f}</b>")
         lines.append(f"📊 Потенциал: {_arrow(main_pot)} <b>{main_pot:+.2f}%</b>")
 
-    # Ориентиры по волатильности
     lr = np.log(close / close.shift(1)).dropna()
     sigma_annual = float(lr.std() * math.sqrt(252))
     lines.append(f"\n📉 Волатильность: <b>{sigma_annual * 100:.1f}%</b> годовых")
@@ -404,20 +404,22 @@ async def _process(tickers: list[str], mode: str) -> str:
 
 # ================= КЛАВИАТУРЫ =================
 def _main_menu_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.add(CallbackButton(text="📈 Получить прогноз", payload="menu:forecast"))
-    kb.add(CallbackButton(text="🎯 Цель", payload="menu:target"))
-    kb.adjust(1)
-    return kb.as_markup()
+    return (
+        InlineKeyboardBuilder()
+        .callback("📈 Получить прогноз", "menu:forecast")
+        .callback("🎯 Цель", "menu:target")
+        .adjust(1)
+    )
 
 
 def _after_report_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.add(CallbackButton(text="📈 Ещё прогноз", payload="menu:forecast"))
-    kb.add(CallbackButton(text="🎯 Ещё цель", payload="menu:target"))
-    kb.add(CallbackButton(text="🏠 Меню", payload="menu:home"))
-    kb.adjust(2, 1)
-    return kb.as_markup()
+    return (
+        InlineKeyboardBuilder()
+        .callback("📈 Ещё прогноз", "menu:forecast")
+        .callback("🎯 Ещё цель", "menu:target")
+        .callback("🏠 Меню", "menu:home")
+        .adjust(2, 1)
+    )
 
 
 # ================= ХЕНДЛЕРЫ =================
@@ -429,8 +431,8 @@ async def _show_menu(event):
         "Выберите действие:",
         attachments=[
             {"type": "image", "payload": {"url": BANNER_URL}},
-            _main_menu_keyboard(),
         ],
+        keyboard=_main_menu_keyboard(),
     )
 
 
@@ -446,18 +448,14 @@ async def on_message(event):
     if not text or text.startswith("/"):
         return
 
-    # Разбор тикеров
     raw = text.replace(";", ",").replace(" ", ",")
     tickers = list(dict.fromkeys(
         t.strip().upper() for t in raw.split(",") if t.strip()
     ))[:5]
 
-    mode = _USER_STATE.pop(user_id, None)
-    if mode is None:
-        # Пользователь написал тикер без выбора режима — по умолчанию прогноз
-        mode = "forecast"
+    mode = _USER_STATE.pop(user_id, None) or "forecast"
 
-    await event.message.answer(f"⏳ <i>Считаю {mode == 'target' and 'цель' or 'прогноз'}…</i>")
+    await event.message.answer(f"⏳ <i>Считаю {'цель' if mode == 'target' else 'прогноз'}…</i>")
     try:
         result = await asyncio.wait_for(_process(tickers, mode), timeout=15)
     except asyncio.TimeoutError:
@@ -465,7 +463,7 @@ async def on_message(event):
     except Exception as e:
         result = f"❌ Ошибка: {e}"
 
-    await event.message.answer(result, attachments=[_after_report_keyboard()])
+    await event.message.answer(result, keyboard=_after_report_keyboard())
 
 
 @dp.message_callback()
@@ -508,3 +506,4 @@ if __name__ == "__main__":
         asyncio.create_task(_warmup())
         await dp.start_polling(bot)
     asyncio.run(main())
+)
